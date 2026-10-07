@@ -3,6 +3,12 @@
 An interlock trip is sticky: once a reason is recorded the latch stays set
 until an operator explicitly resets it. That keeps a transient ammonia reading
 from quietly letting the compressors restart.
+
+Legacy: this single-bit latch has no level distinction and no authorization on
+``reset``.  New safety behaviour lives in
+:class:`coldstore.interlock.graded.GradedInterlock`, which grades the leak,
+stages the shutdown and gates reset behind a per-level approval policy.  Keep
+this latch only for existing callers and tests.
 """
 
 from __future__ import annotations

@@ -20,6 +20,7 @@ from coldstore.valve import OPEN, validate_valve
 
 from . import checks, history, ops
 from . import describe as describe_module
+from . import graded as graded_handlers
 from . import simulate as simulate_module
 from . import snapshot as snapshot_module
 from . import telemetry as telemetry_module
@@ -681,3 +682,19 @@ def cycle(server: "Server", request: Request) -> Response:
 
 def simulate(server: "Server", request: Request) -> Response:
     return simulate_module.run_simulation(server.runtime, request)
+
+
+# Graded interlock handlers re-exported for the route table.
+graded_state = graded_handlers.graded_state
+graded_levels = graded_handlers.graded_levels
+graded_trip = graded_handlers.graded_trip
+graded_trip_reading = graded_handlers.graded_trip_reading
+graded_sequence = graded_handlers.graded_sequence
+graded_sequence_advance = graded_handlers.graded_sequence_advance
+graded_reset_request = graded_handlers.graded_reset_request
+graded_reset_approve = graded_handlers.graded_reset_approve
+graded_reset_reject = graded_handlers.graded_reset_reject
+graded_requests = graded_handlers.graded_requests
+graded_reset_scope = graded_handlers.graded_reset_scope
+graded_ledger = graded_handlers.graded_ledger
+graded_ledger_verify = graded_handlers.graded_ledger_verify

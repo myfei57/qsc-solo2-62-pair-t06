@@ -8,7 +8,7 @@ from coldstore.comp import Bank
 from coldstore.defrost import Controller
 from coldstore.evap import Condenser
 from coldstore.fan import FanSet
-from coldstore.interlock import Interlock
+from coldstore.interlock import GradedInterlock, Interlock
 from coldstore.load import LoadCalculator
 from coldstore.quota import Accumulator
 from coldstore.room import RoomRegistry
@@ -39,4 +39,5 @@ class Runtime:
         self.load = LoadCalculator(store)
         self.accumulator = Accumulator(store)
         self.auditor = Auditor(store)
+        self.graded = GradedInterlock(store, self.auditor)
         self.scheduler = Scheduler(store)

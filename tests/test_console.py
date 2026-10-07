@@ -60,6 +60,7 @@ class ConsoleCase(unittest.TestCase):
                 "temp",
                 "ammonia",
                 "interlock",
+                "graded",
                 "cold_fans",
                 "evap",
                 "defrost",
@@ -316,6 +317,101 @@ class ConsoleCase(unittest.TestCase):
         self.assertFalse(body["tripped"])
         status, body = self.call("POST", "/interlock/clear", {})
         self.assertEqual(body["count"], 0)
+
+    def test_graded_routes_classify_sequence_and_reset(self) -> None:
+        status, levels = self.call("GET", "/graded/levels")
+        self.assertEqual(status, 200)
+        self.assertEqual([band["level"] for band in levels["bands"]], ["L1", "L2", "L3"])
+
+        # A 60 ppm reading against a 25 ppm threshold is L2 directly, not via L1.
+        status, body = self.call("POST", "/graded/read", {"ppm": 60.0, "actor": "monitor"})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["level"], "L2")
+        self.assertTrue(body["raised"])
+
+        status, body = self.call("GET", "/graded")
+        self.assertTrue(body["active"])
+        self.assertEqual(body["level"], "L2")
+        self.assertEqual(body["ledger"]["ok"], True)
+
+        # Reset is refused until every shutdown rung is in position.
+        status, body = self.call(
+            "POST",
+            "/graded/reset/request",
+            {"actor": "op1", "role": "operator", "clear_declared": True},
+        )
+        self.assertEqual(status, 400)
+
+        for _ in range(6):
+            status, body = self.call("POST", "/graded/sequence/advance", {"actor": "op1"})
+        self.assertEqual(status, 200)
+        self.assertTrue(body["complete"])
+
+        # Operator scope is empty; safety officer sees L2 and L3.
+        status, body = self.call("GET", "/graded/reset/scope", {"role": "operator"})
+        self.assertEqual(body["levels"], [])
+        status, body = self.call("GET", "/graded/reset/scope", {"role": "safety_officer"})
+        self.assertEqual(body["levels"], ["L2", "L3"])
+
+        # Two-person review: request then independent approval.
+        status, body = self.call(
+            "POST",
+            "/graded/reset/request",
+            {"actor": "op1", "role": "operator", "clear_declared": True},
+        )
+        self.assertEqual(body["status"], "open")
+        request_id = body["id"]
+
+        status, body = self.call(
+            "POST",
+            "/graded/reset/approve",
+            {"request_id": request_id, "actor": "op1", "role": "safety_officer",
+             "clear_attested": True},
+        )
+        self.assertEqual(status, 400)  # approver must be a different person
+
+        status, body = self.call(
+            "POST",
+            "/graded/reset/approve",
+            {"request_id": request_id, "actor": "so1", "role": "safety_officer",
+             "clear_attested": True},
+        )
+        self.assertEqual(body["status"], "executed")
+        status, body = self.call("GET", "/graded")
+        self.assertFalse(body["active"])
+
+        status, body = self.call("GET", "/graded/ledger")
+        self.assertEqual(status, 200)
+        self.assertGreaterEqual(body["count"], 9)
+        self.assertTrue(body["verification"]["ok"])
+        status, body = self.call("GET", "/graded/ledger/verify")
+        self.assertTrue(body["ok"])
+
+    def test_graded_l3_requires_manager_countersign_route(self) -> None:
+        self.call("POST", "/graded/trip", {"level": "L3", "reason": "major"})
+        for _ in range(8):
+            self.call("POST", "/graded/sequence/advance", {"actor": "op1"})
+        status, body = self.call(
+            "POST",
+            "/graded/reset/request",
+            {"actor": "sup1", "role": "shift_supervisor", "clear_declared": True},
+        )
+        request_id = body["id"]
+        self.call(
+            "POST",
+            "/graded/reset/approve",
+            {"request_id": request_id, "actor": "so1", "role": "safety_officer",
+             "clear_attested": True},
+        )
+        status, body = self.call("GET", "/graded/reset/requests")
+        self.assertEqual(body["requests"][0]["status"], "open")
+        status, body = self.call(
+            "POST",
+            "/graded/reset/approve",
+            {"request_id": request_id, "actor": "mgr1", "role": "install_manager",
+             "clear_attested": True},
+        )
+        self.assertEqual(body["status"], "executed")
 
     def test_load_and_quota_routes(self) -> None:
         self.add_room("r1", 1, -10.0)
