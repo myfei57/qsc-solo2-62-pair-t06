@@ -26,6 +26,7 @@ def text_report(rt: Runtime) -> str:
         f"temp: {describe['temp']}",
         f"ammonia: {describe['ammonia']}",
         f"interlock: {describe['interlock']}",
+        f"graded: {describe['graded']}",
         f"cold_fans: {describe['cold_fans']}",
         f"evap: {describe['evap']}",
         f"defrost: {describe['defrost']}",

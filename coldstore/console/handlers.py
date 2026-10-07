@@ -578,6 +578,70 @@ def interlock_clear(server: "Server", request: Request) -> Response:
     return json_response({"count": interlock.count()})
 
 
+def graded_state(server: "Server", request: Request) -> Response:
+    return json_response(server.runtime.graded.state().as_dict())
+
+
+def graded_trip(server: "Server", request: Request) -> Response:
+    graded = server.runtime.graded
+    level = request.str_field("level")
+    run = graded.trip(
+        level,
+        request.str_field("reason", "manual"),
+        request.str_field("actor", "console"),
+        zone=request.int_field("zone", 0),
+        target=request.str_field("target"),
+    )
+    return json_response({"run": run, "latched": graded.latched(level)})
+
+
+def graded_evaluate(server: "Server", request: Request) -> Response:
+    ppm = request.float_field("ppm")
+    validate_ppm(ppm)
+    result = server.runtime.graded.evaluate(
+        ppm,
+        request.str_field("actor", "auto"),
+        zone=request.int_field("zone", 0),
+        target=request.str_field("target"),
+    )
+    return json_response(result)
+
+
+def graded_advance(server: "Server", request: Request) -> Response:
+    run = server.runtime.graded.advance(request.str_field("run_id"))
+    return json_response({"run": run})
+
+
+def graded_approve(server: "Server", request: Request) -> Response:
+    result = server.runtime.graded.approve(
+        request.str_field("actor"),
+        request.str_field("role"),
+        request.str_field("level"),
+    )
+    return json_response(result)
+
+
+def graded_resettable(server: "Server", request: Request) -> Response:
+    role = request.str_field("role") or request.query.get("role", [""])[0]
+    return json_response(server.runtime.graded.resettable(role))
+
+
+def graded_ledger(server: "Server", request: Request) -> Response:
+    graded = server.runtime.graded
+    return json_response(
+        {
+            "records": [record.as_dict() for record in graded.ledger_records()],
+            "count": graded.ledger_count(),
+        }
+    )
+
+
+def graded_ledger_verify(server: "Server", request: Request) -> Response:
+    graded = server.runtime.graded
+    ok, broken = graded.verify()
+    return json_response({"ok": ok, "broken_seq": broken, "count": graded.ledger_count()})
+
+
 def load_state(server: "Server", request: Request) -> Response:
     return json_response(server.runtime.load.state(server.runtime.rooms).as_dict())
 

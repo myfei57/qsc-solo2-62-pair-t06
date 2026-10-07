@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 
@@ -13,7 +14,8 @@ from coldstore.comp import validate_stage
 from coldstore.defrost import Controller as DefrostController
 from coldstore.evap import Condenser, validate_baseline as validate_evap_baseline
 from coldstore.fan import PRIMARY, STANDBY, FanSet
-from coldstore.interlock import Interlock
+from coldstore.interlock import GradedInterlock, Interlock, level_for_ppm
+from coldstore.interlock.ledger import LEDGER_KEY
 from coldstore.load import LoadCalculator, compute_load, validate_baseline
 from coldstore.ns import Stage, control_line
 from coldstore.quota import Accumulator, Quota, check_quota, validate_amount
@@ -372,6 +374,232 @@ class InterlockCase(unittest.TestCase):
             interlock.clear_log()
             self.assertEqual(interlock.count(), 0)
             self.assertEqual(interlock.state().count, 0)
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+class GradedInterlockCase(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.store = Store.open(f"{self._tmp.name}/state.json")
+        self.auditor = Auditor(self.store)
+        self.bank = CompressorBank()
+        self.bank.add_compressor("c1", 4)
+        self.bank.add_compressor("c2", 2)
+        self.supply = SupplyValve(self.store)
+        self.rooms = RoomRegistry()
+        self.rooms.add_room("r1", 1, -20.0)
+        self.rooms.assign_compressor("r1", "c1")
+        self.rooms.add_room("r2", 2, -10.0)
+        self.rooms.assign_compressor("r2", "c2")
+        self.cold_fans = FanSet()
+        self.cold_fans.add_fan("f1", PRIMARY)
+        self.evap_fans = FanSet()
+        self.clock = FakeClock()
+        self.graded = GradedInterlock(
+            self.store,
+            self.auditor,
+            self.bank,
+            self.supply,
+            self.rooms,
+            self.cold_fans,
+            self.evap_fans,
+            clock=self.clock,
+            step_timeout=30.0,
+        )
+
+    def tearDown(self) -> None:
+        self.store.close()
+        self._tmp.cleanup()
+
+    def start_line(self) -> None:
+        self.bank.start("c1")
+        self.bank.start("c2")
+        self.supply.open_valve("c1")
+        self.supply.open_valve("c2")
+        self.cold_fans.start("f1")
+
+    def finish(self, run: dict) -> dict:
+        while run["status"] == "active":
+            run = self.graded.advance(run["id"])
+        return run
+
+    def test_trip_jumps_straight_to_the_demanded_level(self) -> None:
+        thresholds = {"L1": 15.0, "L2": 25.0, "L3": 50.0}
+        self.assertEqual(level_for_ppm(5.0, thresholds), "")
+        self.assertEqual(level_for_ppm(20.0, thresholds), "L1")
+        self.assertEqual(level_for_ppm(30.0, thresholds), "L2")
+        self.assertEqual(level_for_ppm(80.0, thresholds), "L3")
+
+        self.start_line()
+        result = self.graded.evaluate(80.0, "auto")
+        self.assertTrue(result["tripped"])
+        self.assertEqual(result["level"], "L3")
+        # straight to the top: the lower levels never latch on the way up
+        self.assertEqual(self.graded.latched_levels(), ["L3"])
+
+    def test_evaluate_skips_levels_covered_by_a_higher_latch(self) -> None:
+        self.start_line()
+        self.graded.trip("L3", "ammonia", "operator")
+        covered = self.graded.evaluate(20.0, "auto")
+        self.assertFalse(covered["tripped"])
+        self.assertIn("covered", str(covered["note"]))
+        below = self.graded.evaluate(5.0, "auto")
+        self.assertFalse(below["tripped"])
+
+    def test_shutdown_sequence_advances_one_confirmed_step_at_a_time(self) -> None:
+        self.start_line()
+        run = self.graded.trip("L3", "ammonia", "operator")
+        steps = run["steps"]
+        self.assertEqual(
+            [step["name"] for step in steps],
+            ["stop_compressor", "stop_compressor", "close_valve", "close_valve", "stop_cold_fans"],
+        )
+        self.assertEqual(steps[0]["status"], "active")
+        self.assertTrue(all(step["status"] == "pending" for step in steps[1:]))
+
+        run = self.graded.advance()
+        self.assertEqual(run["steps"][0]["status"], "confirmed")
+        self.assertEqual(run["steps"][1]["status"], "active")
+        self.assertFalse(self.bank.compressor("c1").running)
+        self.assertTrue(self.bank.compressor("c2").running)
+
+        run = self.graded.advance()
+        self.assertFalse(self.bank.compressor("c2").running)
+        # valves stay open until every compressor stop has confirmed
+        self.assertTrue(self.supply.is_open("c1"))
+
+        run = self.finish(run)
+        self.assertEqual(run["status"], "complete")
+        self.assertEqual(self.supply.opened_ids(), [])
+        self.assertEqual(self.cold_fans.running_ids(), [])
+        # the latch stays set until the level is reset through approvals
+        self.assertEqual(self.graded.latched_levels(), ["L3"])
+
+    def test_l1_isolates_only_the_target(self) -> None:
+        self.start_line()
+        run = self.finish(self.graded.trip("L1", "leak at c1", "operator", target="c1"))
+        self.assertEqual(run["status"], "complete")
+        self.assertFalse(self.bank.compressor("c1").running)
+        self.assertFalse(self.supply.is_open("c1"))
+        # the rest of the line keeps running: no more full line stops
+        self.assertTrue(self.bank.compressor("c2").running)
+        self.assertTrue(self.supply.is_open("c2"))
+        self.assertEqual(self.cold_fans.running_ids(), ["f1"])
+
+    def test_l2_scopes_to_the_zone(self) -> None:
+        self.start_line()
+        run = self.finish(self.graded.trip("L2", "zone leak", "operator", zone=1))
+        self.assertEqual(run["status"], "complete")
+        self.assertFalse(self.bank.compressor("c1").running)
+        self.assertTrue(self.bank.compressor("c2").running)
+
+    def test_step_timeout_escalates_one_level_up(self) -> None:
+        self.start_line()
+        run = self.graded.trip("L1", "leak", "operator", target="ghost")
+        run = self.graded.advance()
+        self.assertEqual(run["status"], "active")
+        self.clock.now += 31.0
+        self.graded.advance()
+        # the failed isolation escalated; both latches now hold
+        self.assertEqual(self.graded.latched_levels(), ["L1", "L2"])
+        kinds = [record.kind for record in self.graded.ledger_records()]
+        self.assertIn("step_timeout", kinds)
+        self.assertIn("escalate", kinds)
+        # the escalated L2 sequence widens to the whole line
+        run = self.finish(self.graded.active_run("L2"))
+        self.assertEqual(run["status"], "complete")
+        self.assertEqual(self.bank.running_ids(), [])
+
+    def test_l1_reset_is_a_single_operator_confirmation(self) -> None:
+        self.start_line()
+        self.finish(self.graded.trip("L1", "leak", "operator", target="c1"))
+        result = self.graded.approve("op1", "operator", "L1")
+        self.assertTrue(result["reset"])
+        self.assertEqual(self.graded.latched_levels(), [])
+
+    def test_reset_quorums_are_levelled(self) -> None:
+        self.start_line()
+        self.finish(self.graded.trip("L3", "ammonia", "operator"))
+
+        self.graded.trip("L2", "zone leak", "operator", zone=1)
+        with self.assertRaises(ValueError):
+            self.graded.approve("sup1", "supervisor", "L2")  # sequence still active
+        self.finish(self.graded.active_run("L2"))
+
+        with self.assertRaises(ValueError):
+            self.graded.approve("op1", "operator", "L2")  # role too low
+        result = self.graded.approve("sup1", "supervisor", "L2")
+        self.assertTrue(result["reset"])
+        # resets walk level by level: clearing L2 never touches L3
+        self.assertEqual(self.graded.latched_levels(), ["L3"])
+
+        with self.assertRaises(ValueError):
+            self.graded.approve("op1", "operator", "L3")
+        result = self.graded.approve("sup1", "supervisor", "L3")
+        self.assertFalse(result["reset"])
+        with self.assertRaises(ValueError):
+            self.graded.approve("sup1", "supervisor", "L3")  # no double voting
+        result = self.graded.approve("sup2", "supervisor", "L3")
+        self.assertFalse(result["reset"])  # two approvals but no safety officer
+        result = self.graded.approve("safety1", "safety", "L3")
+        self.assertTrue(result["reset"])
+        self.assertEqual(self.graded.latched_levels(), [])
+
+    def test_resettable_lists_scope_per_level(self) -> None:
+        self.start_line()
+        self.finish(self.graded.trip("L2", "zone leak", "operator", zone=1))
+        table = self.graded.resettable("operator")
+        levels = {entry["level"]: entry for entry in table["levels"]}
+        self.assertTrue(levels["L2"]["latched"])
+        self.assertFalse(levels["L1"]["latched"])
+        self.assertTrue(levels["L1"]["may_approve"])
+        self.assertFalse(levels["L2"]["may_approve"])
+        self.assertEqual(levels["L3"]["approvals_required"], 2)
+        self.assertTrue(levels["L3"]["require_safety"])
+
+    def test_thresholds_must_stay_ordered(self) -> None:
+        self.assertEqual(self.graded.thresholds()["L2"], 25.0)
+        self.graded.set_threshold("L1", 10.0)
+        self.assertEqual(self.graded.thresholds()["L1"], 10.0)
+        with self.assertRaises(ValueError):
+            self.graded.set_threshold("L1", 30.0)
+        with self.assertRaises(ValueError):
+            self.graded.set_threshold("L2", -1.0)
+
+    def test_ledger_is_append_only_and_tamper_evident(self) -> None:
+        self.start_line()
+        self.finish(self.graded.trip("L3", "ammonia", "operator"))
+        self.graded.approve("sup1", "supervisor", "L3")
+        self.graded.approve("safety1", "safety", "L3")
+
+        ok, _ = self.graded.verify()
+        self.assertTrue(ok)
+        records = self.graded.ledger_records()
+        self.assertEqual([record.seq for record in records], list(range(1, len(records) + 1)))
+        self.assertEqual(records[0].kind, "trip")
+        self.assertIn("reset", [record.kind for record in records])
+        self.assertIn("graded", self.graded.describe())
+
+        # every event is mirrored to the audit stream
+        self.assertIn("interlock:trip", self.auditor.kinds())
+        self.assertIn("interlock:reset", self.auditor.kinds())
+
+        # forge history and the hash chain breaks at the touched record
+        raw = load_commands(self.store, LEDGER_KEY)
+        payload = json.loads(raw[1])
+        payload["detail"] = "forged"
+        raw[1] = json.dumps(payload)
+        self.store.put(LEDGER_KEY, json.dumps(raw))
+        ok, broken = self.graded.verify()
+        self.assertFalse(ok)
+        self.assertEqual(broken, 2)
 
 
 class CompressorCase(unittest.TestCase):

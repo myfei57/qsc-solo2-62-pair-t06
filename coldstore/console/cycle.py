@@ -26,6 +26,10 @@ def run_cycle(rt: Runtime, request: Request) -> Response:
 
     verdict = rt.temp.record(temp)
     ammonia = rt.ammonia.detect(ppm)
+    zone = 0
+    if room_id:
+        zone, _ = rt.rooms.room_zone(room_id)
+    graded = rt.graded.evaluate(ammonia.calibrated, actor="cycle", zone=zone, target=comp_id)
     tripped = False
     if ammonia.trip:
         rt.interlock.trip(f"ammonia {ammonia.calibrated:.2f} ppm")
@@ -54,6 +58,8 @@ def run_cycle(rt: Runtime, request: Request) -> Response:
             "within_window": verdict.within,
             "ammonia_level": ammonia.level,
             "tripped": tripped,
+            "graded_level": graded["level"],
+            "graded_tripped": graded["tripped"],
             "stage": rt.compressors.stage(comp_id)[0] if comp_id else 0,
             "supply_open": rt.supply.is_open(comp_id) if comp_id else False,
             "defrosting": rt.defrost.defrosting(),

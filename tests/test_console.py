@@ -60,6 +60,7 @@ class ConsoleCase(unittest.TestCase):
                 "temp",
                 "ammonia",
                 "interlock",
+                "graded",
                 "cold_fans",
                 "evap",
                 "defrost",
@@ -316,6 +317,74 @@ class ConsoleCase(unittest.TestCase):
         self.assertFalse(body["tripped"])
         status, body = self.call("POST", "/interlock/clear", {})
         self.assertEqual(body["count"], 0)
+
+    def test_graded_interlock_routes(self) -> None:
+        self.call("POST", "/comp/add", {"id": "c1", "stages": 4})
+        self.call("POST", "/comp/start", {"id": "c1"})
+        self.call("POST", "/valve/open", {"id": "c1"})
+
+        status, body = self.call("GET", "/interlock/graded")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["latched"], {"L1": False, "L2": False, "L3": False})
+        self.assertEqual(body["thresholds"]["L2"], 25.0)
+
+        # a severe reading jumps straight to L3 without latching L1/L2 first
+        status, body = self.call("POST", "/interlock/graded/evaluate", {"ppm": 80.0})
+        self.assertTrue(body["tripped"])
+        self.assertEqual(body["level"], "L3")
+        status, body = self.call("GET", "/interlock/graded")
+        self.assertEqual(body["latched"], {"L1": False, "L2": False, "L3": True})
+
+        # the shutdown sequence walks one confirmed step at a time
+        run_id = body["runs"][0]["id"]
+        status, body = self.call("POST", "/interlock/graded/advance", {"run_id": run_id})
+        self.assertEqual(body["run"]["steps"][0]["status"], "confirmed")
+        self.assertEqual(body["run"]["steps"][1]["status"], "active")
+        while body["run"]["status"] == "active":
+            status, body = self.call("POST", "/interlock/graded/advance", {"run_id": run_id})
+        self.assertEqual(body["run"]["status"], "complete")
+        status, body = self.call("GET", "/comp")
+        self.assertEqual(body["running"], 0)
+
+        # L3 reset needs two distinct approvers, one of them safety
+        status, error = self.call(
+            "POST", "/interlock/graded/approve", {"actor": "op1", "role": "operator", "level": "L3"}
+        )
+        self.assertEqual(status, 400)
+        status, body = self.call(
+            "POST", "/interlock/graded/approve", {"actor": "sup1", "role": "supervisor", "level": "L3"}
+        )
+        self.assertTrue(body["approved"])
+        self.assertFalse(body["reset"])
+        status, body = self.call(
+            "POST", "/interlock/graded/approve", {"actor": "safety1", "role": "safety", "level": "L3"}
+        )
+        self.assertTrue(body["reset"])
+        status, body = self.call("GET", "/interlock/graded")
+        self.assertFalse(body["latched"]["L3"])
+
+        # the review endpoint lists the resettable scope per level
+        status, body = self.call("GET", "/interlock/resettable", {"role": "operator"})
+        levels = {entry["level"]: entry for entry in body["levels"]}
+        self.assertTrue(levels["L1"]["may_approve"])
+        self.assertFalse(levels["L3"]["may_approve"])
+        self.assertEqual(levels["L3"]["approvals_required"], 2)
+
+        # history is hash chained and mirrored to the audit stream
+        status, body = self.call("GET", "/interlock/ledger")
+        self.assertGreater(body["count"], 0)
+        self.assertEqual(body["records"][0]["kind"], "trip")
+        status, body = self.call("GET", "/interlock/ledger/verify")
+        self.assertTrue(body["ok"])
+        status, body = self.call("POST", "/audit/filter", {"kind": "interlock:trip"})
+        self.assertEqual(len(body["entries"]), 1)
+
+        # a cycle reading drives the same graded evaluation
+        status, body = self.call(
+            "POST", "/cycle", {"room_id": "", "comp_id": "", "temp": -18.0, "ppm": 60.0, "amount": 1.0}
+        )
+        self.assertEqual(body["graded_level"], "L3")
+        self.assertTrue(body["graded_tripped"])
 
     def test_load_and_quota_routes(self) -> None:
         self.add_room("r1", 1, -10.0)
